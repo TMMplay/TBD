@@ -3,7 +3,7 @@
 
 ## Opis
 
-Projekt do wykrania pozycji obiektów na zaszumionym tle na podstawie wcześniej zarejestrowanych klatek.
+Projekt do śledzenia pozycji obiektów na zaszumionym tle na podstawie wcześniej zarejestrowanych klatek.
 
 ## Cechy
 
