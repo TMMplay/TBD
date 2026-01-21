@@ -5,6 +5,8 @@
 
 Projekt do śledzenia pozycji obiektów na zaszumionym tle na podstawie wcześniej zarejestrowanych klatek.
 
+Wykonano w ramach projektu Zachodniopomorskiego Uniwersytetu Technologicznego w Szczecinie pn. "Wsparcie studentów zespołu badawczo-wdrożeniowego realizującego wizyjny wielokamerowy system nadzoru przestrzeni powietrznej do śledzenia bezzałogowych statków powietrznych (BSP/UAV) z wykorzystaniem algorytmów śledzenia przed detekcją (TBD – Track-Before-Detect)" w ramach projektu niekonkurencyjnego pt. „Wsparcie studentów w zakresie podniesienia ich kompetencji i umiejętności” (Działanie 01.05 Umiejętności w szkolnictwie wyższym, Program Fundusze Europejskie dla Rozwoju Społecznego 2021-2027).
+
 ## Cechy
 
 - Możliwość wykrywania bardzo małych zarejestrowanych obiektów 
