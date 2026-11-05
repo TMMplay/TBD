@@ -52,7 +52,7 @@ Skompilowany program uruchamiamy podając jego ścieżkę w terminalu, podając 
 
  >>>
 
-Wykryty rozmiar: 100x100, klatek: 100, glebokosc: 7
+Wykryty rozmiar: 100x100, klatek: 100, glebokosc: 7, promien: 1
 GPU: NVIDIA GeForce RTX 5090 (sm_120, 170 SM)
 Czas calkowity: ... s (... FPS, z wczytywaniem plikow)
 Wykryte punkty przelotu zostaly zapisane do pliku: wynik.csv
@@ -63,11 +63,15 @@ Dodatkowe opcje:
 
 - `--verify` – każde okno jest dodatkowo liczone pierwotnym algorytmem (warstwa po warstwie + `thrust::max_element`) i porównywane z wynikiem szybkiej ścieżki (wolne, tylko do sprawdzenia poprawności),
 - `--threads N` – liczba wątków wczytujących pliki BMP (domyślnie min(8, liczba rdzeni)),
+- `--promien P` – maksymalne przesunięcie obiektu między kolejnymi klatkami w pikselach: poprzednik punktu jest szukany w otoczeniu (2P+1)×(2P+1) zamiast 3×3 (domyślnie `P = 1`, czyli dotychczasowe działanie). Działa w trybie folderu i w `--bench` (również z `--verify`),
+- `--predkosc V` – tylko dla `--bench`: prędkość syntetycznego obiektu w px/klatkę (domyślnie równa `P`),
 - `--bench <SZER>x<WYS> [klatek] [glebokosc]` – benchmark na syntetycznych klatkach generowanych na GPU (bez dysku), np.:
 
 ```
  ./main --bench 2560x1440 300 7
  ./main --bench 2560x1440 50 7 --verify
+ ./main --bench 2560x1440 300 7 --promien 3          # obiekt porusza się o 3 px/klatkę
+ ./main frames 7 wynik.csv --promien 2
 ```
 
 
@@ -79,7 +83,8 @@ Program przetwarza klatki strumieniowo, więc działa w czasie rzeczywistym niez
 - pliki BMP są czytane równolegle przez kilka wątków do pamięci *pinned*, kopiowane asynchronicznie i konwertowane do skali szarości na GPU,
 - wszystkie `L-1` warstw programowania dynamicznego liczone są jednym kernelem na kafelkach 64×32 w pamięci współdzielonej (z otoczką `L-1` pikseli), a wyszukiwanie maksimum jest połączone z ostatnią warstwą (`atomicMax` na kluczu 64-bit) – wcześniej było `L-1` osobnych kerneli, każdy z `cudaMalloc/cudaFree`, zapis nieużywanej tablicy indeksów i synchroniczne `thrust::max_element` + `cudaMemcpy` na każdą klatkę,
 - w pętli nie ma żadnych alokacji ani synchronizacji CPU↔GPU; wyniki są pobierane raz na końcu,
-- głębokości większe niż 12 są dzielone na kilka przebiegów kernela, więc działa dowolna głębokość.
+- głębokości większe niż 12 są dzielone na kilka (możliwie równych) przebiegów kernela, więc działa dowolna głębokość,
+- dla `--promien P > 1` otoczka kafelka rośnie o `P` pikseli na warstwę, a maksimum z otoczenia (2P+1)×(2P+1) liczone jest separowalnie (najpierw w poziomie, potem w pionie, koszt O(P) zamiast O(P²) na piksel). Liczba warstw w jednym przebiegu jest dobierana tak, aby kafelek mieścił się w połowie pamięci współdzielonej SM (min. 2 bloki na SM) – na RTX 5090: P=2 → 8, P=3 → 5, P=4 → 4, P=5 → 3, P=6…8 → 2, P≥9 → 1 warstwa; maksymalny promień ograniczony jest pamięcią współdzieloną bloku (na RTX 5090 ok. 32). Dla `P = 1` używana jest dotychczasowa ścieżka 3×3.
 
 Koszt obliczeń GPU na klatkę 2560×1440 przy `L = 7` to rząd ułamka milisekundy, więc przy odczycie z dysku wąskim gardłem jest przepustowość dysku (klatka BMP 24-bit 2560×1440 ≈ 11 MB, czyli ~170 MB/s dla 15 FPS).
 Wyniki są bit w bit identyczne z pierwotną wersją (dla obrazów kwadratowych; dla niekwadratowych poprawiono błędną interpretację wymiarów).
