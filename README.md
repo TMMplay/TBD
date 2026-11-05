@@ -31,8 +31,16 @@ Wyniki są zapisywane do pliku `wykryte_pozycje.csv` lub do wskazanego pliku w f
 
 ## Instalacja
 
-Do działania programu potrzebne jest środowisko Linux wraz z zainstalowanymi biliotekami CUDA od firmy NVidia.
-Program należy skompilować komendą `nvcc main.cu -o main` znajdując się w tym samym folderze.
+Do działania programu potrzebne jest środowisko Linux wraz z zainstalowanym CUDA Toolkit firmy NVidia.
+Dla kart z serii RTX 50xx (Blackwell, np. RTX 5090) wymagane jest CUDA **12.8 lub nowsze**.
+
+```
+make                  # RTX 5090 (sm_120)
+make ARCH=sm_89       # np. RTX 40xx
+make ARCH=native      # architektura karty zainstalowanej w komputerze
+```
+
+lub ręcznie: `nvcc -O3 -std=c++17 -arch=sm_120 src/main.cu -o main`.
 
 
 ## Użycie
@@ -44,14 +52,41 @@ Skompilowany program uruchamiamy podając jego ścieżkę w terminalu, podając 
 
  >>>
 
-Wykryty rozmiar: 100x100
-Czas calkowity: 0.176129 s
-Wykryte punkty przelotu zostały zapisane do pliku: wynik.csv
+Wykryty rozmiar: 100x100, klatek: 100, glebokosc: 7
+GPU: NVIDIA GeForce RTX 5090 (sm_120, 170 SM)
+Czas calkowity: ... s (... FPS, z wczytywaniem plikow)
+Wykryte punkty przelotu zostaly zapisane do pliku: wynik.csv
 
  ```
+
+Dodatkowe opcje:
+
+- `--verify` – każde okno jest dodatkowo liczone pierwotnym algorytmem (warstwa po warstwie + `thrust::max_element`) i porównywane z wynikiem szybkiej ścieżki (wolne, tylko do sprawdzenia poprawności),
+- `--threads N` – liczba wątków wczytujących pliki BMP (domyślnie min(8, liczba rdzeni)),
+- `--bench <SZER>x<WYS> [klatek] [glebokosc]` – benchmark na syntetycznych klatkach generowanych na GPU (bez dysku), np.:
+
+```
+ ./main --bench 2560x1440 300 7
+ ./main --bench 2560x1440 50 7 --verify
+```
+
+
+## Wydajność (2K, głębokość ≥ 7)
+
+Program przetwarza klatki strumieniowo, więc działa w czasie rzeczywistym niezależnie od długości sekwencji:
+
+- na GPU trzymane jest tylko `L` ostatnich klatek (bufor pierścieniowy), a nie cała sekwencja – wcześniej 2K × 1000 klatek wymagało ~30 GB VRAM i tyle samo RAM, a indeksowanie przepełniało `int` po ~580 klatkach 2K,
+- pliki BMP są czytane równolegle przez kilka wątków do pamięci *pinned*, kopiowane asynchronicznie i konwertowane do skali szarości na GPU,
+- wszystkie `L-1` warstw programowania dynamicznego liczone są jednym kernelem na kafelkach 64×32 w pamięci współdzielonej (z otoczką `L-1` pikseli), a wyszukiwanie maksimum jest połączone z ostatnią warstwą (`atomicMax` na kluczu 64-bit) – wcześniej było `L-1` osobnych kerneli, każdy z `cudaMalloc/cudaFree`, zapis nieużywanej tablicy indeksów i synchroniczne `thrust::max_element` + `cudaMemcpy` na każdą klatkę,
+- w pętli nie ma żadnych alokacji ani synchronizacji CPU↔GPU; wyniki są pobierane raz na końcu,
+- głębokości większe niż 12 są dzielone na kilka przebiegów kernela, więc działa dowolna głębokość.
+
+Koszt obliczeń GPU na klatkę 2560×1440 przy `L = 7` to rząd ułamka milisekundy, więc przy odczycie z dysku wąskim gardłem jest przepustowość dysku (klatka BMP 24-bit 2560×1440 ≈ 11 MB, czyli ~170 MB/s dla 15 FPS).
+Wyniki są bit w bit identyczne z pierwotną wersją (dla obrazów kwadratowych; dla niekwadratowych poprawiono błędną interpretację wymiarów).
+
 
 ## Wymagania
 
 - System operacyjny Linux (np. Ubuntu 22.04)
-- Sterowniki CUDA firmy Nvidia w wersji V12.0.140
+- CUDA Toolkit 12.8+ (dla RTX 50xx; dla starszych kart wystarczy 12.0 z odpowiednim `ARCH`)
 - Kompilator nvcc
