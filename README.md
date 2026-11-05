@@ -64,12 +64,31 @@ Dodatkowe opcje:
 - `--verify` – każde okno jest dodatkowo liczone pierwotnym algorytmem (warstwa po warstwie + `thrust::max_element`) i porównywane z wynikiem szybkiej ścieżki (wolne, tylko do sprawdzenia poprawności),
 - `--threads N` – liczba wątków wczytujących pliki BMP (domyślnie min(8, liczba rdzeni)),
 - `--prog K`, `--wynik`, `--tlo A`, `--polaryzacja P` – próg wykrycia i model tła (opis niżej),
+- `--obiekty K` – liczba obiektów wykrywanych w każdej klatce (domyślnie 1, maksymalnie 256); dla `K > 1` zamiast pojedynczego maksimum wyszukiwane jest `K` najlepszych maksimów lokalnych końcowej mapy kosztu,
+- `--nms R` – promień tłumienia niemaksymalnego (NMS) w pikselach dla `--obiekty K > 1` (domyślnie 8): punkt jest brany pod uwagę tylko wtedy, gdy ma największy koszt w swoim otoczeniu `(2R+1)×(2R+1)` (przy remisie wygrywa mniejszy indeks piksela, tak jak dla `K = 1`), więc dwa wykryte punkty są zawsze oddalone o więcej niż `R` w poziomie lub w pionie,
 - `--bench <SZER>x<WYS> [klatek] [glebokosc]` – benchmark na syntetycznych klatkach generowanych na GPU (bez dysku), np.:
 
 ```
  ./main --bench 2560x1440 300 7
  ./main --bench 2560x1440 50 7 --verify
+ ./main --bench 2560x1440 300 7 --obiekty 2 --nms 8   # dwa obiekty syntetyczne
 ```
+
+### Wiele obiektów (`--obiekty K`)
+
+Dla domyślnego `K = 1` plik wyjściowy ma format `<x>,<y>` (bez zmian względem poprzednich wersji). Dla `K > 1` każdy wiersz (jedna klatka) zawiera do `K` trójek posortowanych malejąco według kosztu:
+
+```
+x1,y1,w1,x2,y2,w2,...,xK,yK,wK
+```
+
+gdzie `x`, `y` to pozycja (w tym samym układzie co dla `K = 1`), a `w` to *wynik* punktu, czyli (koszt − średnia) / odchylenie standardowe końcowej mapy kosztu (patrz „Próg wykrycia”). Z `--prog` punkty o wyniku poniżej progu są pomijane. Jeśli obraz ma mniej maksimów lokalnych niż `K` (albo mniej punktów powyżej progu), wiersz zawiera mniej trójek. Pozycja pierwszej trójki jest zawsze taka sama jak wynik dla `K = 1`.
+
+```
+ ./main frames 7 wynik.csv --obiekty 3 --nms 10
+```
+
+Wyszukiwanie odbywa się w całości na GPU, asynchronicznie (bez synchronizacji na klatkę): ostatnia warstwa zapisuje mapę kosztu do bufora roboczego, kernel na kafelkach 32×32 (pamięć współdzielona z otoczką `R`, maksimum rozdzielne: poziome, potem pionowe) wyznacza maksima lokalne i zachowuje co najwyżej `K` najlepszych z każdego kafelka, a jednoblokowy kernel wybiera z nich `K` najlepszych (radix select + sortowanie). Promień `R` jest ograniczony rozmiarem pamięci współdzielonej (ok. 180 pikseli na RTX 5090). Z `--verify` wszystkie `K` punktów każdego okna są dodatkowo porównywane z referencją na CPU.
 
 
 ## Próg wykrycia i model tła
