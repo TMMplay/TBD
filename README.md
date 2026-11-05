@@ -63,11 +63,31 @@ Dodatkowe opcje:
 
 - `--verify` – każde okno jest dodatkowo liczone pierwotnym algorytmem (warstwa po warstwie + `thrust::max_element`) i porównywane z wynikiem szybkiej ścieżki (wolne, tylko do sprawdzenia poprawności),
 - `--threads N` – liczba wątków wczytujących pliki BMP (domyślnie min(8, liczba rdzeni)),
+- `--prog K`, `--wynik`, `--tlo A`, `--polaryzacja P` – próg wykrycia i model tła (opis niżej),
 - `--bench <SZER>x<WYS> [klatek] [glebokosc]` – benchmark na syntetycznych klatkach generowanych na GPU (bez dysku), np.:
 
 ```
  ./main --bench 2560x1440 300 7
  ./main --bench 2560x1440 50 7 --verify
+```
+
+
+## Próg wykrycia i model tła
+
+**Próg wykrycia (`--prog K`, `--wynik`).** Dla każdej klatki liczony jest *wynik* = (maksimum − średnia) / odchylenie standardowe mapy kosztu ostatniej warstwy, czyli o ile odchyleń standardowych najlepsza ścieżka wyróżnia się z tła. Z `--prog K` klatki z wynikiem < K dostają w CSV pozycję `-1,-1` (brak obiektu). `--wynik` dopisuje wynik jako trzecią kolumnę. Bez tych opcji format CSV jest taki jak wcześniej.
+
+Na końcu program wypisuje rozkład wyniku (min / mediana / p95 / max). Próg najłatwiej dobrać, uruchamiając program na nagraniu **bez obiektu** i ustawiając `K` nieco powyżej maksymalnego wyniku.
+
+**Model tła (`--tlo A`, `--polaryzacja jasny|ciemny|oba`).** Dla każdego piksela utrzymywana jest wykładniczo ważona średnia i wariancja jasności (współczynnik `A`, np. `0.05` ≈ pamięć ~40 klatek). Do algorytmu zamiast jasności trafia znormalizowane odchylenie od tła `z = (jasność − średnia) / σ` (σ uśrednione w oknie 3×3). Dzięki temu:
+
+- statyczne jasne elementy sceny (budynki, słońce, gradient nieba) przestają „wygrywać” z obiektem,
+- szum ma tę samą skalę w całym obrazie, więc próg `--prog` nie zależy od jasności tła,
+- `--polaryzacja ciemny` wykrywa obiekty ciemniejsze od tła (np. dron na tle jasnego nieba), a `oba` – jaśniejsze i ciemniejsze.
+
+Model tła wymaga nieruchomej kamery i przez pierwsze ~1/`A` klatek się „uczy”. Na sztucznych danych z bardzo silnym szumem, gdzie obiekt ma po prostu maksymalną jasność (jak w `example/frames`), lepiej działa tryb domyślny bez `--tlo`.
+
+```
+ ./main nagranie 7 wynik.csv --tlo 0.05 --polaryzacja oba --prog 8 --wynik
 ```
 
 
