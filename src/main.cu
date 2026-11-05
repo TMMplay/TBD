@@ -40,6 +40,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -305,22 +306,32 @@ __global__ void bg_feature(const unsigned char* __restrict__ raw, size_t rowByte
     varOut[i] = (1.0f - alpha) * (v + alpha * d * d);
 }
 
-// Jeden przebieg programowania dynamicznego dla R kolejnych warstw:
+// Jeden przebieg programowania dynamicznego dla nLayers kolejnych warstw:
 //   C_0 = prev
-//   C_j(p) = max_{q in 3x3(p)} C_{j-1}(q) + frame_j(p)     (poza obrazem C = 0)
-// Kafelek wyjsciowy TILE_X x TILE_Y jest liczony wraz z otoczka R pikseli,
-// ktora z kazda warstwa zmniejsza sie o 1. Cale obliczenia odbywaja sie w
-// pamieci wspoldzielonej. FINAL=true: zamiast zapisu kosztu liczony jest
+//   C_j(p) = max_{q w otoczeniu (2P+1)x(2P+1) punktu p} C_{j-1}(q) + frame_j(p)
+//   (poza obrazem C = 0, czyli sasiad spoza obrazu daje 0)
+// P = promien ruchu (o ile pikseli obiekt moze sie przesunac miedzy klatkami).
+// Kafelek wyjsciowy TILE_X x TILE_Y jest liczony wraz z otoczka R = P*nLayers
+// pikseli, ktora z kazda warstwa zmniejsza sie o P. Cale obliczenia odbywaja
+// sie w pamieci wspoldzielonej. FINAL=true: zamiast zapisu kosztu liczony jest
 // argmax calego obrazu (atomicMax na kluczu 64-bit).
 //
+// GEN=false: szybka sciezka dla P = 1 (bezposrednio 3x3, jedna synchronizacja
+// na warstwe, bufory A/B zamieniane co warstwe).
+// GEN=true: dowolne P, maksimum separowalne (najpierw poziomo do bufora B,
+// potem pionowo z powrotem do A) - koszt O(P) zamiast O(P^2) na piksel.
+//
 // max(a_i) + c daje bit w bit ten sam wynik co max(a_i + c), bo zaokraglenie
-// float jest monotoniczne - wyniki sa identyczne z wersja pierwotna.
-template <bool FINAL>
+// float jest monotoniczne, a fmaxf jest dokladne (kolejnosc i rozbicie na
+// max poziomy/pionowy nie zmienia wyniku) - wyniki sa identyczne z wersja
+// pierwotna.
+template <bool FINAL, bool GEN>
 __global__ void __launch_bounds__(BLOCK_THREADS)
-tbd_fused(const float* __restrict__ prev, const __grid_constant__ SegmentFrames frames, int R, int W, int H,
-          float* __restrict__ outCost, unsigned long long* __restrict__ bestKey,
+tbd_fused(const float* __restrict__ prev, const __grid_constant__ SegmentFrames frames, int nLayers, int P,
+          int W, int H, float* __restrict__ outCost, unsigned long long* __restrict__ bestKey,
           double* __restrict__ stats) {
     extern __shared__ float smem[];
+    const int R = GEN ? P * nLayers : nLayers;  // otoczka kafelka
     const int SX = TILE_X + 2 * R;
     const int SY = TILE_Y + 2 * R;
     float* A = smem;
@@ -343,31 +354,73 @@ tbd_fused(const float* __restrict__ prev, const __grid_constant__ SegmentFrames 
     }
     __syncthreads();
 
-    for (int j = 1; j <= R; ++j) {
-        const float* __restrict__ cur = frames.f[j - 1];
-        for (int ly = j + ty; ly < SY - j; ly += BLOCK_Y) {
-            const int gy = y0 + ly;
-            const bool rowIn = (gy >= 0) && (gy < H);
-            const float* curRow = cur + (size_t)(rowIn ? gy : 0) * W;
-            for (int lx = j + tx; lx < SX - j; lx += BLOCK_X) {
-                const int gx = x0 + lx;
-                float v = 0.0f;
-                if (rowIn && gx >= 0 && gx < W) {
-                    const float* a = A + (ly - 1) * SX + lx;
-                    float m = fmaxf(fmaxf(a[-1], a[0]), a[1]);
-                    a += SX;
-                    m = fmaxf(m, fmaxf(fmaxf(a[-1], a[0]), a[1]));
-                    a += SX;
-                    m = fmaxf(m, fmaxf(fmaxf(a[-1], a[0]), a[1]));
-                    v = m + __ldg(curRow + gx);
+    if (!GEN) {
+        for (int j = 1; j <= nLayers; ++j) {
+            const float* __restrict__ cur = frames.f[j - 1];
+            for (int ly = j + ty; ly < SY - j; ly += BLOCK_Y) {
+                const int gy = y0 + ly;
+                const bool rowIn = (gy >= 0) && (gy < H);
+                const float* curRow = cur + (size_t)(rowIn ? gy : 0) * W;
+                for (int lx = j + tx; lx < SX - j; lx += BLOCK_X) {
+                    const int gx = x0 + lx;
+                    float v = 0.0f;
+                    if (rowIn && gx >= 0 && gx < W) {
+                        const float* a = A + (ly - 1) * SX + lx;
+                        float m = fmaxf(fmaxf(a[-1], a[0]), a[1]);
+                        a += SX;
+                        m = fmaxf(m, fmaxf(fmaxf(a[-1], a[0]), a[1]));
+                        a += SX;
+                        m = fmaxf(m, fmaxf(fmaxf(a[-1], a[0]), a[1]));
+                        v = m + __ldg(curRow + gx);
+                    }
+                    B[ly * SX + lx] = v;
                 }
-                B[ly * SX + lx] = v;
             }
+            __syncthreads();
+            float* t = A;
+            A = B;
+            B = t;
         }
-        __syncthreads();
-        float* t = A;
-        A = B;
-        B = t;
+    } else {
+        // Warstwa j: A (warstwa j-1) jest poprawne w obszarze [lo-P, S-lo+P),
+        // wynik warstwy j powstaje w obszarze [lo, S-lo), lo = P*j.
+        // 1) B = max poziome z A: wiersze [lo-P, SY-lo+P) (wszystkie potrzebne
+        //    w kroku pionowym), kolumny [lo, SX-lo).
+        // 2) A = max pionowe z B + klatka: obszar [lo, S-lo). Stare A nie jest
+        //    juz potrzebne po kroku 1, wiec po warstwie wynik jest znowu w A.
+        const int span = 2 * P;
+        for (int j = 1; j <= nLayers; ++j) {
+            const float* __restrict__ cur = frames.f[j - 1];
+            const int lo = P * j;
+            const int loIn = lo - P;
+            for (int ly = loIn + ty; ly < SY - loIn; ly += BLOCK_Y) {
+                const float* aRow = A + ly * SX - P;
+                for (int lx = lo + tx; lx < SX - lo; lx += BLOCK_X) {
+                    const float* a = aRow + lx;
+                    float m = a[0];
+                    for (int d = 1; d <= span; ++d) m = fmaxf(m, a[d]);
+                    B[ly * SX + lx] = m;
+                }
+            }
+            __syncthreads();
+            for (int ly = lo + ty; ly < SY - lo; ly += BLOCK_Y) {
+                const int gy = y0 + ly;
+                const bool rowIn = (gy >= 0) && (gy < H);
+                const float* curRow = cur + (size_t)(rowIn ? gy : 0) * W;
+                for (int lx = lo + tx; lx < SX - lo; lx += BLOCK_X) {
+                    const int gx = x0 + lx;
+                    float v = 0.0f;
+                    if (rowIn && gx >= 0 && gx < W) {
+                        const float* b = B + (ly - P) * SX + lx;
+                        float m = b[0];
+                        for (int d = 1; d <= span; ++d) m = fmaxf(m, b[d * SX]);
+                        v = m + __ldg(curRow + gx);
+                    }
+                    A[ly * SX + lx] = v;
+                }
+            }
+            __syncthreads();
+        }
     }
 
     // A zawiera teraz koszt koncowy; poprawny jest obszar [R, R+TILE).
@@ -622,20 +675,23 @@ nms_select_topk(const unsigned long long* __restrict__ cand, unsigned int* __res
 }
 
 // ---- wersja referencyjna (pierwotny algorytm), uzywana tylko z --verify ----
+// Uogolniona na promien P: wszystkie (2P+1)^2 przesuniecia, dla P = 1 jest to
+// dokladnie pierwotne 9 sasiadow.
 __global__ void ref_layer(const float* __restrict__ prev, const float* __restrict__ cur,
-                          float* __restrict__ out, int W, int H) {
+                          float* __restrict__ out, int W, int H, int P) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
-    const int off[9][2] = {{1, 1}, {1, 0}, {1, -1}, {0, 1}, {0, 0}, {0, -1}, {-1, 1}, {-1, 0}, {-1, -1}};
     float best = -1e30f;
-    for (int n = 0; n < 9; ++n) {
-        int yy = y + off[n][0];
-        int xx = x + off[n][1];
-        float val = 0.0f;
-        if (yy >= 0 && yy < H && xx >= 0 && xx < W) val = prev[(size_t)yy * W + xx];
-        val += cur[(size_t)y * W + x];
-        if (val > best) best = val;
+    for (int dy = P; dy >= -P; --dy) {
+        for (int dx = P; dx >= -P; --dx) {
+            int yy = y + dy;
+            int xx = x + dx;
+            float val = 0.0f;
+            if (yy >= 0 && yy < H && xx >= 0 && xx < W) val = prev[(size_t)yy * W + xx];
+            val += cur[(size_t)y * W + x];
+            if (val > best) best = val;
+        }
     }
     out[(size_t)y * W + x] = best;
 }
@@ -652,8 +708,9 @@ __device__ __forceinline__ uint32_t hash3(uint32_t x, uint32_t y, uint32_t t) {
 }
 
 // Szum (0..127, 1% "soli" o jasnosci 200) + obiekt 2x2 o jasnosci 255
-// poruszajacy sie po przekatnej o 1 piksel na klatke (opcjonalnie drugi
-// obiekt (objX2, objY2); wspolrzedne ujemne = brak). Zapis w formacie
+// poruszajacy sie po przekatnej (pozycje liczy runBench, domyslnie o 1 piksel
+// na klatke, z --promien P o P pikseli na klatke); opcjonalnie drugi obiekt
+// (objX2, objY2; wspolrzedne ujemne = brak). Zapis w formacie
 // surowych danych BMP 24-bit (jak z pliku).
 __global__ void synth_bmp24(unsigned char* __restrict__ raw, size_t rowBytes, int W, int H, int t,
                             int objX, int objY, int objX2 = -10, int objY2 = -10) {
@@ -719,6 +776,7 @@ struct Options {
     bool printScore = false;       // --wynik: trzecia kolumna CSV
     int K = 1;                     // --obiekty
     int nmsR = 8;                  // --nms
+    int P = 1;                     // --promien
 };
 
 // Wykryty punkt: pozycja, koszt i "wynik" = (koszt - srednia) / odchylenie
@@ -737,7 +795,9 @@ struct WindowResult {
 class TbdEngine {
 public:
     TbdEngine(int W, int H, int L, const BmpLayout& layout, int maxWindows, const Options& opt)
-        : W_(W), H_(H), L_(L), layout_(layout), verify_(opt.verify), opt_(opt), K_(opt.K), nmsR_(opt.nmsR) {
+        : W_(W), H_(H), L_(L), P_(opt.P), layout_(layout), verify_(opt.verify), opt_(opt), K_(opt.K),
+          nmsR_(opt.nmsR) {
+        configureLayers();
         const size_t frameBytes = (size_t)W * H * sizeof(float);
         ring_.resize(L);
         for (int i = 0; i < L; ++i) CUDA_CHECK(cudaMalloc(&ring_[i], frameBytes));
@@ -760,9 +820,6 @@ public:
             CUDA_CHECK(cudaMalloc(&ref_[0], frameBytes));
             CUDA_CHECK(cudaMalloc(&ref_[1], frameBytes));
         }
-        const int maxSmem = smemBytes(MAX_FUSED_LAYERS);
-        CUDA_CHECK(cudaFuncSetAttribute(tbd_fused<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSmem));
-        CUDA_CHECK(cudaFuncSetAttribute(tbd_fused<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSmem));
         if (K_ > 1) initPeaks(maxWindows);
     }
 
@@ -789,6 +846,7 @@ public:
     // Nastepna klatka ponownie zainicjalizuje model tla.
     void resetBackground() { bgInitialized_ = false; }
     unsigned char* rawBuffer() const { return d_raw_; }
+    int layersPerPass() const { return maxLayers_; }
 
     // Konwersja surowej klatki (w d_raw_) do pierscienia jako klatka nr t:
     // jasnosc albo (z --tlo) znormalizowane odchylenie od modelu tla.
@@ -817,28 +875,28 @@ public:
     }
 
     // Okno zaczynajace sie od klatki t0, obejmujace D klatek (t0..t0+D-1).
+    // D-1 warstw dzielonych jest na mozliwie rowne przebiegi po co najwyzej
+    // maxLayers_ warstw (np. 19 warstw przy limicie 12 -> 10 + 9).
     void runWindow(long long t0, int D, int windowIdx) {
         unsigned long long* key = d_keys_ + windowIdx;
         double* stats = d_stats_ + 2 * (size_t)windowIdx;
         const int total = D - 1;
+        const int passes = std::max(1, (total + maxLayers_ - 1) / maxLayers_);
         const float* src = frame(t0);
-        int done = 0, ping = 0;
-        dim3 block(BLOCK_X, BLOCK_Y);
-        dim3 grid((W_ + TILE_X - 1) / TILE_X, (H_ + TILE_Y - 1) / TILE_Y);
+        int done = 0, ping = 0, pass = 0;
         do {
-            const int r = std::min(MAX_FUSED_LAYERS, total - done);
+            ++pass;
+            const int r = (int)((long long)total * pass / passes) - done;
             SegmentFrames sf{};
             for (int k = 0; k < r; ++k) sf.f[k] = frame(t0 + done + 1 + k);
             const bool last = (done + r == total);
             if (last && K_ == 1) {
-                tbd_fused<true><<<grid, block, smemBytes(r), stream_>>>(src, sf, r, W_, H_, nullptr, key, stats);
+                launchFused<true>(src, sf, r, nullptr, key, stats);
             } else {
-                tbd_fused<false><<<grid, block, smemBytes(r), stream_>>>(src, sf, r, W_, H_, tmp_[ping], nullptr,
-                                                                    nullptr);
+                launchFused<false>(src, sf, r, tmp_[ping], nullptr, nullptr);
                 src = tmp_[ping];
                 ping ^= 1;
             }
-            CUDA_CHECK(cudaGetLastError());
             done += r;
         } while (done < total);
         // K > 1: koszt koncowy jest w src (bufor tymczasowy) -> NMS + top-K.
@@ -882,8 +940,74 @@ public:
     long long verifyErrors() const { return verifyErrors_; }
 
 private:
-    static int smemBytes(int R) {
-        return 2 * (TILE_X + 2 * R) * (TILE_Y + 2 * R) * (int)sizeof(float);
+    // Pamiec wspoldzielona dla otoczki R (dwa bufory kafelka z otoczka).
+    static size_t smemBytes(long long R) {
+        return 2 * (size_t)(TILE_X + 2 * R) * (size_t)(TILE_Y + 2 * R) * sizeof(float);
+    }
+
+    // Wybor liczby warstw na przebieg (maxLayers_) dla promienia P_.
+    // P = 1: jak dotychczas MAX_FUSED_LAYERS (39 KB pamieci wspoldzielonej).
+    // P > 1: otoczka P*warstwy rosnie szybciej, wiec bierzemy najwiecej warstw
+    // (<= MAX_FUSED_LAYERS), dla ktorych kafelek miesci sie w budzecie: polowa
+    // pamieci wspoldzielonej SM (>= 2 bloki na SM), ale nie mniej niz dla P = 1
+    // i nie wiecej niz limit opt-in na blok. Jesli nawet jedna warstwa nie
+    // miesci sie w budzecie, uzywamy jednej warstwy na przebieg do limitu
+    // opt-in (mniej blokow na SM); powyzej - blad.
+    void configureLayers() {
+        int dev = 0, optin = 0, perSM = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&perSM, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev));
+        cudaFuncAttributes fa;
+        CUDA_CHECK(cudaFuncGetAttributes(&fa, tbd_fused<true, true>));
+        const size_t staticSmem = fa.sharedSizeBytes;  // warpBest (FINAL)
+        const size_t limit = (size_t)optin > staticSmem ? (size_t)optin - staticSmem : 0;
+        const size_t reservedPerBlock = 1024;  // pamiec zarezerwowana przez system na blok
+        const size_t halfSM = (size_t)perSM / 2 > reservedPerBlock + staticSmem
+                                  ? (size_t)perSM / 2 - reservedPerBlock - staticSmem
+                                  : 0;
+        const size_t budget = std::min(limit, std::max(smemBytes(MAX_FUSED_LAYERS), halfSM));
+
+        if (P_ == 1) {
+            maxLayers_ = MAX_FUSED_LAYERS;
+        } else {
+            maxLayers_ = 1;
+            while (maxLayers_ < MAX_FUSED_LAYERS &&
+                   smemBytes((long long)P_ * (maxLayers_ + 1)) <= budget)
+                ++maxLayers_;
+        }
+        const size_t need = smemBytes((long long)(P_ == 1 ? 1 : P_) * maxLayers_);
+        if (need > limit) {
+            int maxP = 1;
+            while (smemBytes(maxP + 1) <= limit) ++maxP;
+            throw std::runtime_error("promien " + std::to_string(P_) +
+                                     " jest za duzy dla tego GPU (pamiec wspoldzielona: potrzeba " +
+                                     std::to_string(need) + " B, dostepne " + std::to_string(limit) +
+                                     " B), maksymalny promien: " + std::to_string(maxP));
+        }
+        auto allowSmem = [need](auto* kernel) {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need));
+        };
+        if (P_ == 1) {
+            allowSmem(tbd_fused<true, false>);
+            allowSmem(tbd_fused<false, false>);
+        } else {
+            allowSmem(tbd_fused<true, true>);
+            allowSmem(tbd_fused<false, true>);
+        }
+    }
+
+    template <bool FINAL>
+    void launchFused(const float* src, const SegmentFrames& sf, int r, float* out, unsigned long long* key,
+                     double* stats) {
+        dim3 block(BLOCK_X, BLOCK_Y);
+        dim3 grid((W_ + TILE_X - 1) / TILE_X, (H_ + TILE_Y - 1) / TILE_Y);
+        if (P_ == 1)
+            tbd_fused<FINAL, false><<<grid, block, smemBytes(r), stream_>>>(src, sf, r, 1, W_, H_, out, key, stats);
+        else
+            tbd_fused<FINAL, true><<<grid, block, smemBytes((long long)P_ * r), stream_>>>(src, sf, r, P_, W_, H_,
+                                                                                          out, key, stats);
+        CUDA_CHECK(cudaGetLastError());
     }
     const float* frame(long long t) const { return ring_[t % L_]; }
 
@@ -941,7 +1065,7 @@ private:
         const float* prev = frame(t0);
         for (int d = 1; d < D; ++d) {
             float* out = ref_[d & 1];
-            ref_layer<<<grid, block, 0, stream_>>>(prev, frame(t0 + d), out, W_, H_);
+            ref_layer<<<grid, block, 0, stream_>>>(prev, frame(t0 + d), out, W_, H_, P_);
             CUDA_CHECK(cudaGetLastError());
             prev = out;
         }
@@ -982,7 +1106,8 @@ private:
         }
     }
 
-    int W_, H_, L_;
+    int W_, H_, L_, P_;
+    int maxLayers_ = MAX_FUSED_LAYERS;
     BmpLayout layout_;
     bool verify_;
     Options opt_;
@@ -1174,7 +1299,7 @@ static void writeCsv(const std::string& path, const std::vector<WindowResult>& r
 static int runFolder(const std::string& folder, int L, const std::string& outputFile, const Options& opt,
                      int threads) {
     const bool verify = opt.verify;
-    const int K = opt.K, nmsR = opt.nmsR;
+    const int K = opt.K, nmsR = opt.nmsR, P = opt.P;
     std::vector<std::string> images;
     for (auto& p : fs::directory_iterator(folder))
         if (p.path().extension() == ".bmp") images.push_back(p.path().string());
@@ -1197,7 +1322,8 @@ static int runFolder(const std::string& folder, int L, const std::string& output
         std::fclose(f);
     }
     const int W = layout.W, H = layout.H;
-    std::cout << "Wykryty rozmiar: " << W << "x" << H << ", klatek: " << N << ", glebokosc: " << L << "\n";
+    std::cout << "Wykryty rozmiar: " << W << "x" << H << ", klatek: " << N << ", glebokosc: " << L
+              << ", promien: " << P << "\n";
     if (K > 1) std::cout << "Obiektow na klatke: " << K << ", promien NMS: " << nmsR << "\n";
     printDevice();
 
@@ -1234,25 +1360,26 @@ static int runFolder(const std::string& folder, int L, const std::string& output
     return verify && engine.verifyErrors() ? 2 : 0;
 }
 
-static int runBench(int W, int H, int N, int L, const Options& opt) {
+static int runBench(int W, int H, int N, int L, const Options& opt, int speed) {
     const bool verify = opt.verify;
-    const int K = opt.K, nmsR = opt.nmsR;
+    const int K = opt.K, nmsR = opt.nmsR, P = opt.P;
     BmpLayout layout;
     layout.W = W;
     layout.H = H;
     layout.channels = 3;
     layout.rowBytes = ((size_t)W * 3 + 3) & ~(size_t)3;
     std::cout << "Benchmark syntetyczny: " << W << "x" << H << ", klatek: " << N << ", glebokosc: " << L
-              << "\n";
+              << ", promien: " << P << ", predkosc obiektu: " << speed << " px/klatke\n";
     if (K > 1)
         std::cout << "Obiektow na klatke: " << K << ", promien NMS: " << nmsR
                   << " (drugi obiekt syntetyczny przesuniety o W/2)\n";
     printDevice();
 
     TbdEngine engine(W, H, L, layout, N, opt);
+    std::cout << "Warstw na przebieg kernela: " << engine.layersPerPass() << "\n";
     auto objPos = [&](long long t, int& x, int& y) {
-        x = (int)((W / 4 + t) % W);
-        y = (int)((H / 4 + t) % H);
+        x = (int)((W / 4 + t * speed) % W);
+        y = (int)((H / 4 + t * speed) % H);
     };
     // Drugi obiekt (tylko dla K > 1): rownolegly tor przesuniety o W/2.
     auto objPos2 = [&](long long t, int& x, int& y) {
@@ -1338,6 +1465,9 @@ static void usage() {
               << MAX_OBJECTS
               << ")\n"
                  "  --nms R               promien tlumienia sasiednich maksimow (domyslnie 8)\n"
+                 "  --promien P           maks. przesuniecie obiektu miedzy klatkami w pikselach\n"
+                 "                        (otoczenie (2P+1)x(2P+1), domyslnie 1 = 3x3)\n"
+                 "  --predkosc V          predkosc obiektu syntetycznego w --bench (domyslnie = P)\n"
                  "  --verify              porownanie z algorytmem referencyjnym\n"
                  "  --threads N           liczba watkow wczytujacych pliki\n";
 }
@@ -1346,6 +1476,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> pos;
     Options opt;
     bool bench = false, polaritySet = false;
+    int speed = -1;
     int threads = (int)std::min(8u, std::max(2u, std::thread::hardware_concurrency()));
     try {
         for (int i = 1; i < argc; ++i) {
@@ -1359,6 +1490,8 @@ int main(int argc, char** argv) {
             else if (a == "--prog" && hasArg) opt.threshold = std::stod(argv[++i]);
             else if (a == "--obiekty" && hasArg) opt.K = std::stoi(argv[++i]);
             else if (a == "--nms" && hasArg) opt.nmsR = std::stoi(argv[++i]);
+            else if (a == "--promien" && hasArg) opt.P = std::stoi(argv[++i]);
+            else if (a == "--predkosc" && hasArg) speed = std::stoi(argv[++i]);
             else if (a == "--polaryzacja" && hasArg) {
                 const std::string v = argv[++i];
                 polaritySet = true;
@@ -1383,6 +1516,10 @@ int main(int argc, char** argv) {
             std::cerr << "--obiekty musi byc w zakresie 1.." << MAX_OBJECTS << ", --nms w zakresie 0..100000\n";
             return 1;
         }
+        if (opt.P < 1 || opt.P > 1000) {
+            std::cerr << "Promien musi byc w zakresie 1..1000\n";
+            return 1;
+        }
         if (polaritySet && opt.bgAlpha <= 0.0f) {
             std::cerr << "--polaryzacja wymaga --tlo\n";
             return 1;
@@ -1404,7 +1541,7 @@ int main(int argc, char** argv) {
                 usage();
                 return 1;
             }
-            return runBench(W, H, N, L, opt);
+            return runBench(W, H, N, L, opt, speed < 0 ? opt.P : speed);
         }
         if (pos.empty()) {
             usage();
